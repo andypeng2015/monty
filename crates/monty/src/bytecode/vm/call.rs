@@ -772,13 +772,9 @@ impl<T: ResourceTracker> VM<'_, T> {
     /// Sets up the function's namespace with bound arguments, cell variables,
     /// and free variables (captured from enclosing scope for closures).
     ///
-    /// Locals are built directly on the VM stack using a [`StackGuard`] that
-    /// automatically rolls back on error. The frame's `stack_base` points to
-    /// the start of this locals region, and operands are pushed above it.
-    ///
-    /// The call position is captured from [`current_position`](Self::current_position),
-    /// which returns `None` when no frames are on the stack (e.g. host-initiated
-    /// calls via [`MontyRepl`](crate::MontyRepl)).
+    /// Locals are built in the reusable `namespace_scratch` buffer (under a
+    /// [`HeapGuard`] for cleanup on error) and moved onto the VM stack, where
+    /// `stack_base` points to the start of the locals region.
     fn call_sync_function(
         &mut self,
         func_id: FunctionId,
@@ -786,7 +782,7 @@ impl<T: ResourceTracker> VM<'_, T> {
         defaults: &[Value],
         args: ArgValues,
     ) -> Result<CallResult, RunError> {
-        let call_position = self.current_position();
+        let call_offset = self.current_offset();
         let stack_base = self.stack.len();
 
         let func = self.interns.get_function(func_id);
@@ -800,8 +796,11 @@ impl<T: ResourceTracker> VM<'_, T> {
         let size = namespace_size * mem::size_of::<Value>();
         self.heap.tracker_mut().on_allocate(|| size)?;
 
-        // 1. Create namespace for the frame in a temporary vec, will extend to stack later
-        let namespace = Vec::with_capacity(func.namespace_size);
+        // 1. Build the namespace in the reusable scratch buffer to avoid a
+        //    per-call allocation. On error `HeapGuard` drops the buffer, so the
+        //    pool just restarts empty next call.
+        let mut namespace = mem::take(&mut self.namespace_scratch);
+        namespace.reserve(namespace_size);
         let mut namespace_guard = HeapGuard::new(namespace, self);
         let (namespace, this) = namespace_guard.as_parts_mut();
 
@@ -821,11 +820,13 @@ impl<T: ResourceTracker> VM<'_, T> {
         let code = &func.code;
 
         // 6. Commit the guard (no rollback) and push the frame. The operand
-        // stack starts immediately above the locals region — any
-        // comprehensions emit their own push/pop bytecode at entry/exit, so
-        // no frame-level region is reserved here.
-        let (namespace, this) = namespace_guard.into_parts();
-        this.stack.extend(namespace);
+        // stack starts immediately above the locals region — comprehensions
+        // emit their own push/pop bytecode, so no frame-level region is
+        // reserved here. `append` empties the buffer (keeping its allocation)
+        // so it can return to the pool.
+        let (mut namespace, this) = namespace_guard.into_parts();
+        this.stack.append(&mut namespace);
+        this.namespace_scratch = namespace;
 
         let exc_stack_base = this.exception_stack.len();
         this.push_frame(CallFrame::new_function(
@@ -834,7 +835,7 @@ impl<T: ResourceTracker> VM<'_, T> {
             locals_count,
             exc_stack_base,
             func_id,
-            call_position,
+            call_offset,
         ))?;
 
         Ok(CallResult::FramePushed)

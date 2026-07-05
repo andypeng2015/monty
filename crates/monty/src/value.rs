@@ -8,7 +8,6 @@ use std::{
     str::FromStr,
 };
 
-use ahash::AHashSet;
 use num_bigint::BigInt;
 use num_integer::Integer;
 use num_traits::{FromPrimitive, ToPrimitive, Zero};
@@ -17,6 +16,7 @@ use smallvec::SmallVec;
 use crate::{
     builtins::Builtins,
     bytecode::{CallResult, VM},
+    defer_drop,
     exception_private::{ExcType, RunError, RunResult, SimpleException},
     fstring::FormatFloat,
     hash::{HashValue, hash_python_long_int, hash_python_str},
@@ -28,7 +28,7 @@ use crate::{
         check_repeat_size,
     },
     types::{
-        Bytes, CmpOrder, List, LongInt, Property, PyTrait, Type, allocate_tuple,
+        Bytes, CmpOrder, LazyHeapSet, List, LongInt, Property, PyTrait, Type, allocate_tuple,
         bytes::{bytes_repr_fmt, get_byte_at_index},
         instance::{instance_getattr, instance_repr, instance_str},
         long_int::{bigint_cmp_f64, check_bits_str_digits_limit, i64_cmp_f64},
@@ -123,7 +123,7 @@ impl From<bool> for Value {
     }
 }
 
-impl PyTrait<'_> for Value {
+impl<'h> PyTrait<'h> for Value {
     fn py_type(&self, vm: &VM<'_, impl ResourceTracker>) -> Type {
         match self {
             Self::Undefined => panic!("Cannot get type of undefined value"),
@@ -318,7 +318,7 @@ impl PyTrait<'_> for Value {
         &self,
         f: &mut impl Write,
         vm: &mut VM<'_, impl ResourceTracker>,
-        heap_ids: &mut AHashSet<HeapId>,
+        heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {
         let interns = vm.interns;
         match self {
@@ -327,7 +327,9 @@ impl PyTrait<'_> for Value {
             Self::None => Ok(f.write_str("None")?),
             Self::Bool(true) => Ok(f.write_str("True")?),
             Self::Bool(false) => Ok(f.write_str("False")?),
-            Self::Int(v) => Ok(write!(f, "{v}")?),
+            // `itoa` formats into a fixed stack buffer, skipping the generic
+            // `fmt`/`pad_integral` path and its repeated `RawVec` reallocation.
+            Self::Int(v) => Ok(f.write_str(itoa::Buffer::new().format(*v))?),
             Self::InternLongInt(long_int_id) => {
                 let bi = interns.get_long_int(*long_int_id);
                 check_bits_str_digits_limit(bi.bits())?;
@@ -361,8 +363,9 @@ impl PyTrait<'_> for Value {
                     // `evaluate_function` issue (see the "Recursive/deep `__repr__`/
                     // `__str__`" divergence in limitations/classes.md) that also
                     // affects `sorted`/`map`/`filter` callbacks.
-                    let s = instance_repr(*id, vm)?;
-                    Ok(f.write_str(&s)?)
+                    let str_value = instance_repr(*id, vm)?;
+                    defer_drop!(str_value, vm);
+                    Ok(f.write_str(str_value.to_str(vm)?)?)
                 } else {
                     heap_ids.insert(*id);
                     let result = vm.heap.read(*id).py_repr_fmt(f, vm, heap_ids);
@@ -375,9 +378,39 @@ impl PyTrait<'_> for Value {
         }
     }
 
-    fn py_str(&self, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Cow<'static, str>> {
+    /// Overrides the default `py_repr` with allocation-light fast paths for the
+    /// values whose repr is cheap to produce:
+    /// - singletons (`None`/`True`/`False`/`Ellipsis`) resolve to a pre-interned
+    ///   `StringId`, so `repr`/`str`/`print`/f-strings allocate nothing at all;
+    /// - `int` formats via `itoa` straight into a right-sized `allocate_string`,
+    ///   skipping the grow-then-shrink intermediate `String`.
+    ///
+    /// Every other variant takes the generic `py_repr_fmt` buffered path. `str`
+    /// is also served allocation-free, but by [`py_str`](Self::py_str) — `repr`
+    /// of a `str` still needs a buffer for quoting/escaping.
+    fn py_repr(&self, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Value> {
         match self {
-            Self::InternString(string_id) => Ok(vm.interns.get_str(*string_id).to_owned().into()),
+            Self::None => Ok(Self::InternString(StaticStrings::NoneRepr.into())),
+            Self::Bool(true) => Ok(Self::InternString(StaticStrings::TrueRepr.into())),
+            Self::Bool(false) => Ok(Self::InternString(StaticStrings::FalseRepr.into())),
+            Self::Ellipsis => Ok(Self::InternString(StaticStrings::EllipsisRepr.into())),
+            Self::Int(i) => Ok(allocate_string(itoa::Buffer::new().format(*i), vm.heap)?),
+            _ => {
+                let mut s = String::new();
+                let mut heap_ids = LazyHeapSet::default();
+                self.py_repr_fmt(&mut s, vm, &mut heap_ids)?;
+                Ok(allocate_string(s, vm.heap)?)
+            }
+        }
+    }
+
+    fn py_str(&self, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Value> {
+        match self {
+            // Interned/heap strings are already what `str()` returns — hand the
+            // same value back (inc-ref'd for the heap case) instead of cloning
+            // the bytes into a fresh allocation.
+            Self::InternString(string_id) => Ok(Self::InternString(*string_id)),
+            Self::Ref(id) if matches!(vm.heap.get(*id), HeapData::Str(_)) => Ok(self.clone_with_heap(vm.heap)),
             // Instances dispatch to a user `__str__`/`__repr__` (needs the heap id).
             Self::Ref(id) if matches!(vm.heap.get(*id), HeapData::Instance(_)) => instance_str(*id, vm),
             Self::Ref(id) => vm.heap.read(*id).py_str(vm),
@@ -2134,20 +2167,31 @@ impl Value {
     /// argument it does not need to own; the borrow keeps `self` and the heap
     /// pinned, so drop/allocate only once it ends.
     pub(crate) fn to_str<'a>(&'a self, vm: &'a VM<'_, impl ResourceTracker>) -> RunResult<&'a str> {
+        self.to_str_heap(vm.heap, vm.interns)
+    }
+
+    /// [`to_str`](Self::to_str) for contexts without a `&VM` — takes `heap` and
+    /// `interns` separately so callers can keep a disjoint `&mut` borrow of
+    /// another `VM` field alive (e.g. resolving a `str` `Value` produced by
+    /// `py_str` while writing it to `vm.print_writer`).
+    pub(crate) fn to_str_heap<'a>(
+        &'a self,
+        heap: &'a Heap<impl ResourceTracker>,
+        interns: &'a Interns,
+    ) -> RunResult<&'a str> {
         match self {
-            Self::InternString(string_id) => Ok(vm.interns.get_str(*string_id)),
-            Self::Ref(heap_id) => match vm.heap.get(*heap_id) {
-                HeapData::Str(s) => Ok(s.as_str()),
-                _ => Err(ExcType::type_error(format!(
-                    "expected string, not {}",
-                    self.py_type_name(vm)
-                ))),
-            },
-            _ => Err(ExcType::type_error(format!(
-                "expected string, not {}",
-                self.py_type_name(vm)
-            ))),
+            Self::InternString(string_id) => return Ok(interns.get_str(*string_id)),
+            Self::Ref(heap_id) => {
+                if let HeapData::Str(s) = heap.get(*heap_id) {
+                    return Ok(s.as_str());
+                }
+            }
+            _ => {}
         }
+        Err(ExcType::type_error(format!(
+            "expected string, not {}",
+            self.py_type_name_heap(heap, interns)
+        )))
     }
 
     /// check if the value is a string.
